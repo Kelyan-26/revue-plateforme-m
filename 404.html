@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Accès réservé</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{display:flex;align-items:center;justify-content:center;background:#fff;color:#333D85;
+       font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:1rem}
+  main{width:100%;max-width:26rem;border:1px solid #333D85;border-radius:6px;padding:2rem 1.5rem}
+  h1{font-size:1.35rem;margin:0 0 .25rem;font-weight:600}
+  p{margin:.25rem 0 1.25rem;color:#4a5080;font-size:.95rem}
+  label{display:block;font-size:.85rem;font-weight:600;margin-bottom:.35rem}
+  input{width:100%;padding:.7rem .8rem;border:1px solid #333D85;border-radius:4px;font:inherit;color:#333D85}
+  input:focus{outline:3px solid #333D8540}
+  button{margin-top:1rem;width:100%;padding:.75rem;border:0;border-radius:4px;background:#333D85;color:#fff;
+         font:inherit;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.6;cursor:wait}
+  #msg{min-height:1.4rem;margin-top:.9rem;font-size:.9rem;color:#a11d1d}
+  #msg.info{color:#333D85}
+</style>
+</head>
+<body>
+<main>
+  <h1>Accès réservé</h1>
+  <p>Saisissez la phrase de passe qui vous a été communiquée.</p>
+  <form id="f" autocomplete="off">
+    <label for="p">Phrase de passe</label>
+    <input id="p" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required autofocus>
+    <button id="b" type="submit">Ouvrir</button>
+    <div id="msg" role="alert" aria-live="polite"></div>
+  </form>
+</main>
+<script>
+(function () {
+  "use strict";
+  var BASE = "/revue-plateforme-m";
+  var f = document.getElementById("f"), p = document.getElementById("p"),
+      b = document.getElementById("b"), msg = document.getElementById("msg");
+  var enc = new TextEncoder();
+
+  function dire(texte, info) { msg.textContent = texte; msg.className = info ? "info" : ""; }
+  function deB64(s) { var r = atob(s), o = new Uint8Array(r.length); for (var i = 0; i < r.length; i++) o[i] = r.charCodeAt(i); return o; }
+
+  var manque = [];
+  if (!(window.crypto && crypto.subtle)) manque.push("WebCrypto");
+  if (!window.indexedDB) manque.push("IndexedDB");
+  if (!("serviceWorker" in navigator)) manque.push("les service workers");
+  if (manque.length) {
+    b.disabled = true; p.disabled = true;
+    dire("Ce navigateur ne permet pas l'accès : " + manque.join(", ") + " indisponible. " +
+         "La navigation privée de certains navigateurs bloque ces fonctions ; ouvrez la page dans une fenêtre normale.");
+    return;
+  }
+
+  function ouvrirBase() {
+    return new Promise(function (ok, ko) {
+      var r = indexedDB.open("revue-plateforme-m", 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore("k"); };
+      r.onsuccess = function () { ok(r.result); };
+      r.onerror = function () { ko(r.error); };
+    });
+  }
+  function ecrire(db, valeur) {
+    return new Promise(function (ok, ko) {
+      var tx = db.transaction("k", "readwrite");
+      tx.objectStore("k").put(valeur, "cles");
+      tx.oncomplete = ok; tx.onerror = function () { ko(tx.error); }; tx.onabort = function () { ko(tx.error); };
+    });
+  }
+
+  async function deriver(phrase, sel, iterations) {
+    var base = await crypto.subtle.importKey("raw", enc.encode(phrase), "PBKDF2", false, ["deriveBits"]);
+    var bits = new Uint8Array(await crypto.subtle.deriveBits(
+      { name: "PBKDF2", hash: "SHA-256", salt: sel, iterations: iterations }, base, 512));
+    var aes = await crypto.subtle.importKey("raw", bits.slice(0, 32), "AES-GCM", false, ["decrypt"]);
+    var hmac = await crypto.subtle.importKey("raw", bits.slice(32, 64), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return { aes: aes, hmac: hmac };
+  }
+
+  function attendreControle() {
+    return new Promise(function (ok, ko) {
+      if (navigator.serviceWorker.controller) return ok();
+      var fini = false;
+      var minuterie = setTimeout(function () { if (!fini) { fini = true; ko(new Error("delai")); } }, 15000);
+      navigator.serviceWorker.addEventListener("controllerchange", function () {
+        if (!fini) { fini = true; clearTimeout(minuterie); ok(); }
+      });
+    });
+  }
+
+  f.addEventListener("submit", async function (ev) {
+    ev.preventDefault();
+    b.disabled = true;
+    dire("Vérification en cours… cela peut prendre jusqu'à vingt secondes sur un téléphone.", true);
+    try {
+      var r = await fetch(BASE + "/porte.json", { cache: "no-store" });
+      if (!r.ok) throw new Error("porte");
+      var porte = await r.json();
+      var sel = deB64(porte.sel);
+      var cles = await deriver(p.value.toUpperCase().replace(/[^A-Z0-9]/g, ""), sel, porte.iterations);
+      var t = deB64(porte.temoin);
+      var clair;
+      try {
+        clair = new TextDecoder().decode(await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: t.slice(0, 12) }, cles.aes, t.slice(12)));
+      } catch (e) { clair = null; }
+      if (clair !== "revue-plateforme-m:phrase-valide") {
+        dire("Phrase de passe incorrecte.");
+        b.disabled = false; p.select();
+        return;
+      }
+      var db = await ouvrirBase();
+      await ecrire(db, { aes: cles.aes, hmac: cles.hmac, sel: porte.sel });
+      db.close();
+      p.value = "";
+      dire("Phrase acceptée, ouverture…", true);
+      await navigator.serviceWorker.register(BASE + "/sw.js", { scope: BASE + "/" });
+      await Promise.race([navigator.serviceWorker.ready,
+        new Promise(function (_, ko) { setTimeout(function () { ko(new Error("delai")); }, 15000); })]);
+      await attendreControle();
+      location.replace(location.href);
+    } catch (e) {
+      b.disabled = false;
+      if (e && e.message === "delai") {
+        dire("Le service worker n'a pas pris le contrôle de la page. Rechargez la page ; si le problème persiste, " +
+             "utilisez une fenêtre de navigation normale (pas privée).");
+      } else {
+        dire("Impossible d'ouvrir l'accès sur ce navigateur (" + (e && e.name ? e.name : "erreur") + "). " +
+             "Essayez une fenêtre de navigation normale.");
+      }
+    }
+  });
+})();
+</script>
+</body>
+</html>
